@@ -2,6 +2,7 @@
  *  OpenSlide, a library for reading whole slide image files
  *
  *  Copyright (c) 2007-2012 Carnegie Mellon University
+ *  Copyright (c) 2021      Benjamin Gilbert
  *  All rights reserved.
  *  Copyright (c) 2021      Benjamin Gilbert
  *
@@ -19,10 +20,6 @@
  *  <http://www.gnu.org/licenses/>.
  *
  */
-
-#ifndef CMAKE_BUILD
-  #include <config.h>
-#endif
 
 #include "openslide-private.h"
 
@@ -56,44 +53,26 @@ struct _openslide_cache_entry {
 };
 
 struct _openslide_cache {
-#if !GLIB_CHECK_VERSION(2,31,0)
   GMutex *mutex;
-#else
-  GMutex mutex;
-#endif
   GQueue *list;
   GHashTable *hashtable;
   int refcount;
   bool released;
   uint64_t next_binding_id;
 
-  uint64_t capacity;
-  uint64_t total_size;
+  int capacity;
+  int total_size;
 
   gint warned_overlarge_entry;
 };
 
-// connection between a cache (possibly shared between multiple slide handles)
-// and a specific slide handle
-struct _openslide_cache_binding {
-#if !GLIB_CHECK_VERSION(2,31,0)
-  GMutex *mutex;
-#else
-  GMutex mutex;
-#endif
-  openslide_cache_t *cache;
-  uint64_t id;  // unique id assigned by cache upon bind
-};
-
-
-
 // eviction
 // mutex must be held
-static void possibly_evict(openslide_cache_t *cache, uint64_t incoming_size) {
+static void possibly_evict(struct _openslide_cache *cache, int incoming_size) {
+  g_assert(incoming_size >= 0);
 
-  uint64_t size = cache->total_size + incoming_size;
-  uint64_t target = cache->capacity;
-  g_assert(size > cache->total_size);
+  int size = cache->total_size + incoming_size;
+  int target = cache->capacity;
 
   while(size > target) {
     // get key of last element
@@ -119,9 +98,8 @@ static guint hash_func(gconstpointer key) {
   const struct _openslide_cache_key *c_key = key;
 
   // assume 32-bit hash
-  return (guint) ((c_key->binding_id << 16) ^
-                  ((guintptr) c_key->plane) ^
-                  ((34369 * (uint64_t) c_key->y) + ((uint64_t) c_key->x) + ((uint64_t) c_key->channel)));
+  return (guint) (((ptr_int) c_key->plane) ^
+                  ((34369 * (uint64_t) c_key->y) + ((uint64_t) c_key->x)));
 }
 
 static gboolean key_equal_func(gconstpointer a,
@@ -129,11 +107,7 @@ static gboolean key_equal_func(gconstpointer a,
   const struct _openslide_cache_key *c_a = a;
   const struct _openslide_cache_key *c_b = b;
 
-  return (c_a->binding_id == c_b->binding_id) &&
-    (c_a->plane == c_b->plane) &&
-    (c_a->x == c_b->x) &&
-    (c_a->y == c_b->y) &&
-    (c_a->channel == c_b->channel);
+  return (c_a->plane == c_b->plane) && (c_a->x == c_b->x) && (c_a->y == c_b->y);
 }
 
 static void hash_destroy_key(gpointer data) {
@@ -154,26 +128,23 @@ static void hash_destroy_value(gpointer data) {
   _openslide_cache_entry_unref(value->entry);
 
   // free the value
-  g_slice_free(struct _openslide_cache_value, value);
+  g_free(value);
 }
 
-openslide_cache_t *_openslide_cache_create(uint64_t capacity_in_bytes) {
-  openslide_cache_t *cache = g_slice_new0(openslide_cache_t);
+struct _openslide_cache *_openslide_cache_create(int capacity_in_bytes) {
+  struct _openslide_cache *cache = g_slice_new0(struct _openslide_cache);
 
   // init mutex
-#if !GLIB_CHECK_VERSION(2,31,0)
   cache->mutex = g_mutex_new();
-#else
-  g_mutex_init (&cache->mutex);
-#endif
+
   // init queue
   cache->list = g_queue_new();
 
   // init hashtable
   cache->hashtable = g_hash_table_new_full(hash_func,
-             key_equal_func,
-             hash_destroy_key,
-             hash_destroy_value);
+					   key_equal_func,
+					   hash_destroy_key,
+					   hash_destroy_value);
 
   // init refcount
   cache->refcount = 1;
@@ -184,68 +155,26 @@ openslide_cache_t *_openslide_cache_create(uint64_t capacity_in_bytes) {
   return cache;
 }
 
-static void cache_ref(openslide_cache_t *cache) {
-#if !GLIB_CHECK_VERSION(2,31,0)
-  g_mutex_lock(cache->mutex);
-#else
-  g_mutex_lock(&cache->mutex);
-#endif
-  cache->refcount++;
-#if !GLIB_CHECK_VERSION(2,31,0)
-  g_mutex_unlock(cache->mutex);
-#else
-  g_mutex_unlock(&cache->mutex);
-#endif
-}
-
-static void cache_unref(openslide_cache_t *cache) {
-#if !GLIB_CHECK_VERSION(2,31,0)
-  g_mutex_lock(cache->mutex);
-#else
-  g_mutex_lock(&cache->mutex);
-#endif
-  // decrement refcount, return if references remain
-  if (--cache->refcount) {
-#if !GLIB_CHECK_VERSION(2,31,0)
-    g_mutex_unlock(cache->mutex);
-#else
-    g_mutex_unlock(&cache->mutex);
-#endif
-    return;
-  }
+void _openslide_cache_destroy(struct _openslide_cache *cache) {
   // clear hashtable (auto-deletes all data)
   g_hash_table_unref(cache->hashtable);
-#if !GLIB_CHECK_VERSION(2,31,0)
   g_mutex_unlock(cache->mutex);
-#else
-  g_mutex_unlock(&cache->mutex);
-#endif
 
   // clear list
   g_queue_free(cache->list);
 
   // free mutex
-#if !GLIB_CHECK_VERSION(2,31,0)
   g_mutex_free(cache->mutex);
-#endif
 
   // destroy struct
-  g_slice_free(struct _openslide_cache, cache);
+  g_free(cache);
 }
 
 void _openslide_cache_release(openslide_cache_t *cache) {
-#if !GLIB_CHECK_VERSION(2,31,0)
-  g_mutex_lock(cache->mutex);
-#else
   g_mutex_lock(&cache->mutex);
-#endif
   bool already_released = cache->released;
   cache->released = true;
-#if !GLIB_CHECK_VERSION(2,31,0)
-  g_mutex_unlock(cache->mutex);
-#else
   g_mutex_unlock(&cache->mutex);
-#endif
   g_return_if_fail(!already_released);
 
   cache_unref(cache);
@@ -253,116 +182,61 @@ void _openslide_cache_release(openslide_cache_t *cache) {
 
 struct _openslide_cache_binding *_openslide_cache_binding_create(void) {
   struct _openslide_cache_binding *cb =
-    g_slice_new0(struct _openslide_cache_binding);
+    g_new0(struct _openslide_cache_binding, 1);
+  g_mutex_init(&cb->mutex);
   cb->cache = _openslide_cache_create(DEFAULT_CACHE_SIZE);
   cb->id = cb->cache->next_binding_id++;
   return cb;
 }
 
-void _openslide_cache_binding_set(struct _openslide_cache_binding *cb,
-                                  openslide_cache_t *cache) {
-  cache_ref(cache);
 
-#if !GLIB_CHECK_VERSION(2,31,0)
+int _openslide_cache_get_capacity(struct _openslide_cache *cache) {
   g_mutex_lock(cache->mutex);
-#else
-  g_mutex_lock(&cache->mutex);
-#endif
-  uint64_t id = cache->next_binding_id++;
-#if !GLIB_CHECK_VERSION(2,31,0)
+  int capacity = cache->capacity;
   g_mutex_unlock(cache->mutex);
-#else
-  g_mutex_unlock(&cache->mutex);
-#endif
-
-#if !GLIB_CHECK_VERSION(2,31,0)
-  g_mutex_lock(cb->mutex);
-#else
-  g_mutex_lock(&cb->mutex);
-#endif
-  openslide_cache_t *old = cb->cache;
-  cb->cache = cache;
-  cb->id = id;
-#if !GLIB_CHECK_VERSION(2,31,0)
-  g_mutex_unlock(cb->mutex);
-#else
-  g_mutex_unlock(&cb->mutex);
-#endif
-
-  cache_unref(old);
+  return capacity;
 }
 
-void _openslide_cache_binding_destroy(struct _openslide_cache_binding *cb) {
-#if !GLIB_CHECK_VERSION(2,31,0)
-  g_mutex_lock(cb->mutex);
-#else
-  g_mutex_lock(&cb->mutex);
-#endif
-  cache_unref(cb->cache);
-#if !GLIB_CHECK_VERSION(2,31,0)
-  g_mutex_unlock(cb->mutex);
-#else
-  g_mutex_unlock(&cb->mutex);
-#endif
+void _openslide_cache_set_capacity(struct _openslide_cache *cache,
+				   int capacity_in_bytes) {
+  g_assert(capacity_in_bytes >= 0);
 
-#if !GLIB_CHECK_VERSION(2,31,0)
-  g_mutex_clear(cb->mutex);
-#else
-  g_mutex_clear(&cb->mutex);
-#endif
-  g_slice_free(struct _openslide_cache_binding, cb);
+  g_mutex_lock(cache->mutex);
+  cache->capacity = capacity_in_bytes;
+  possibly_evict(cache, 0);
+  g_mutex_unlock(cache->mutex);
 }
 
 // put and get
 
 // the cache retains one reference, and the caller gets another one.  the
 // entry must be unreffed when the caller is done with it.
-void _openslide_cache_put(struct _openslide_cache_binding *cb,
-        void *plane,
-        int64_t x,
-        int64_t y,
-        int64_t channel,
-        void *data,
-        uint64_t size_in_bytes,
-        struct _openslide_cache_entry **_entry) {
+void _openslide_cache_put(struct _openslide_cache *cache,
+			  void *plane,
+			  int64_t x,
+			  int64_t y,
+			  void *data,
+			  int size_in_bytes,
+			  struct _openslide_cache_entry **_entry) {
   // always create cache entry for caller's reference
   struct _openslide_cache_entry *entry =
-      g_slice_new(struct _openslide_cache_entry);
+      g_new(struct _openslide_cache_entry, 1);
   // one ref for the caller
   g_atomic_int_set(&entry->refcount, 1);
   entry->data = data;
   entry->size = size_in_bytes;
   *_entry = entry;
 
-  // get cache and lock
-#if !GLIB_CHECK_VERSION(2,31,0)
-  g_mutex_lock(cb->mutex);
-#else
-  g_mutex_lock(&cb->mutex);
-#endif
-  openslide_cache_t *cache = cb->cache;
-#if !GLIB_CHECK_VERSION(2,31,0)
+  // lock
   g_mutex_lock(cache->mutex);
-#else
-  g_mutex_lock(&cache->mutex);
-#endif
 
   // don't try to put anything in the cache that cannot possibly fit
   if (size_in_bytes > cache->capacity) {
     //g_debug("refused %p", entry);
-#if !GLIB_CHECK_VERSION(2,31,0)
     g_mutex_unlock(cache->mutex);
-#else
-    g_mutex_unlock(&cache->mutex);
-#endif
     _openslide_performance_warn_once(&cache->warned_overlarge_entry,
                                      "Rejecting overlarge cache entry of "
-                                     "size %"PRIu64" bytes", size_in_bytes);
-#if !GLIB_CHECK_VERSION(2,31,0)
-    g_mutex_unlock(cb->mutex);
-#else
-    g_mutex_unlock(&cb->mutex);
-#endif
+                                     "size %d bytes", size_in_bytes);
     return;
   }
 
@@ -370,7 +244,6 @@ void _openslide_cache_put(struct _openslide_cache_binding *cb,
 
   // create key
   struct _openslide_cache_key *key = g_slice_new(struct _openslide_cache_key);
-  key->binding_id = cb->id;
   key->plane = plane;
   key->x = x;
   key->y = y;
@@ -378,7 +251,7 @@ void _openslide_cache_put(struct _openslide_cache_binding *cb,
 
   // create value
   struct _openslide_cache_value *value =
-    g_slice_new(struct _openslide_cache_value);
+    g_new(struct _openslide_cache_value, 1);
   value->key = key;
   value->cache = cache;
   value->entry = entry;
@@ -397,57 +270,28 @@ void _openslide_cache_put(struct _openslide_cache_binding *cb,
   g_atomic_int_inc(&entry->refcount);
 
   // unlock
-#if !GLIB_CHECK_VERSION(2,31,0)
   g_mutex_unlock(cache->mutex);
-  g_mutex_unlock(cb->mutex);
-#else
-  g_mutex_unlock(&cache->mutex);
-  g_mutex_unlock(&cb->mutex);
-#endif
 
   //g_debug("insert %p", entry);
 }
 
 // entry must be unreffed when the caller is done with the data
-void *_openslide_cache_get(struct _openslide_cache_binding *cb,
-         void *plane,
-         int64_t x,
-         int64_t y,
-         int64_t channel,
-         struct _openslide_cache_entry **_entry) {
-  // get cache and lock
-#if !GLIB_CHECK_VERSION(2,31,0)
-  g_mutex_lock(cb->mutex);
-#else
-  g_mutex_lock(&cb->mutex);
-#endif
-  openslide_cache_t *cache = cb->cache;
-#if !GLIB_CHECK_VERSION(2,31,0)
+void *_openslide_cache_get(struct _openslide_cache *cache,
+			   void *plane,
+			   int64_t x,
+			   int64_t y,
+			   struct _openslide_cache_entry **_entry) {
+  // lock
   g_mutex_lock(cache->mutex);
-#else
-  g_mutex_lock(&cache->mutex);
-#endif
 
   // create key
-  struct _openslide_cache_key key = {
-    .binding_id = cb->id,
-    .plane = plane,
-    .x = x,
-    .y = y,
-    .channel = channel
-  };
+  struct _openslide_cache_key key = { .plane = plane, .x = x, .y = y };
 
   // lookup key, maybe return NULL
   struct _openslide_cache_value *value = g_hash_table_lookup(cache->hashtable,
                    &key);
   if (value == NULL) {
-#if !GLIB_CHECK_VERSION(2,31,0)
     g_mutex_unlock(cache->mutex);
-    g_mutex_unlock(cb->mutex);
-#else
-    g_mutex_unlock(&cache->mutex);
-    g_mutex_unlock(&cb->mutex);
-#endif
     *_entry = NULL;
     return NULL;
   }
@@ -464,13 +308,7 @@ void *_openslide_cache_get(struct _openslide_cache_binding *cb,
   //g_debug("cache hit! %p %"PRIu64" %p %"PRId64" %"PRId64, (void *) entry, cb->id, (void *) plane, x, y);
 
   // unlock
-#if !GLIB_CHECK_VERSION(2,31,0)
   g_mutex_unlock(cache->mutex);
-  g_mutex_unlock(cb->mutex);
-#else
-  g_mutex_unlock(&cache->mutex);
-  g_mutex_unlock(&cb->mutex);
-#endif
 
   // return data
   *_entry = entry;
@@ -483,10 +321,10 @@ void _openslide_cache_entry_unref(struct _openslide_cache_entry *entry) {
 
   if (g_atomic_int_dec_and_test(&entry->refcount)) {
     // free the data
-    g_slice_free1(entry->size, entry->data);
+    g_free(entry->data);
 
     // free the entry
-    g_slice_free(struct _openslide_cache_entry, entry);
+    g_free(entry);
 
     //g_debug("free %p", entry);
   }
